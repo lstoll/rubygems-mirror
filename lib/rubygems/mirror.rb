@@ -1,5 +1,6 @@
 require 'rubygems'
 require 'fileutils'
+require 'zlib'
 
 class Gem::Mirror
   autoload :Fetcher, 'rubygems/mirror/fetcher'
@@ -14,8 +15,8 @@ class Gem::Mirror
 
   RUBY = 'ruby'
 
-  def initialize(from = DEFAULT_URI, to = DEFAULT_TO, parallelism = nil, retries = nil, skiperror = nil)
-    @from, @to = from, to
+  def initialize(from: DEFAULT_URI, to: DEFAULT_TO, parallelism: nil, retries: nil, skiperror: nil, maxage: nil, minversions: nil)
+    @from, @to, @maxage, @minversions  = from, to, maxage, minversions
     @fetcher = Fetcher.new :retries => retries, :skiperror => skiperror
     @pool = Pool.new(parallelism || 10)
   end
@@ -39,19 +40,53 @@ class Gem::Mirror
   end
 
   def gems
-    gems = []
+    @gems ||= begin
+      gems = []
 
-    SPECS_FILES.each do |sf|
-      update_specs unless File.exist?(to(sf))
+      SPECS_FILES.each do |sf|
+        update_specs unless File.exist?(to(sf))
 
-      gems += Marshal.load(File.read(to(sf)))
+        gems += Marshal.load(File.read(to(sf)))
+      end
+
+      gems.map! do |name, ver, plat|
+        # If the platform is ruby, it is not in the gem name
+        "#{name}-#{ver}#{"-#{plat}" unless plat == RUBY}.gem"
+      end
+      gems
     end
+  end
 
-    gems.map! do |name, ver, plat|
-      # If the platform is ruby, it is not in the gem name
-      "#{name}-#{ver}#{"-#{plat}" unless plat == RUBY}.gem"
+  def candidate_gems
+    @candidate_gems ||= begin
+      candidates = []
+      gem_map = Hash.new {|h,k| h[k] = []}
+      # Need to get at least x versions of each, and for max age.
+      # So lets loop all of the gems
+      # For each gem,
+      gems.each do |gem|
+        spec = parse_gemspec(gem)
+        p spec
+        next unless spec
+
+        gem_map[spec.name] << spec
+      end
+
+      # Sort the list newest -> oldest
+      gem_map.each do |name, specs|
+        specs.sort_by!(&:version)
+        # iterate through the list. when we hit iteration > minversions AND now-date > maxage, drop it.
+        iter = 0
+        specs.reverse_each do |spec|
+          unless iter > @minversions && ((Time.now - spec.date) / 60 / 60 / 24) > @maxage
+            candidates << "#{spec.full_name}.gem"
+          end
+          iter += 1
+        end
+      end
+
+      candidates
     end
-    gems
   end
 
   def existing_gems
@@ -63,7 +98,7 @@ class Gem::Mirror
   end
 
   def gems_to_fetch
-    gems - existing_gems
+    candidate_gems - existing_gems
   end
 
   def gemspecs_to_fetch
@@ -71,7 +106,25 @@ class Gem::Mirror
   end
 
   def gems_to_delete
-    existing_gems - gems
+    existing_gems - candidate_gems
+  end
+
+  def parse_gemspec(gem)
+    begin
+      Marshal.load(Zlib::Inflate.inflate(File.read(to("quick/Marshal.#{Gem.marshal_version}/#{gem}spec.rz"))))
+    rescue => e
+      puts "Error loading gemspec for gem #{gem}: #{e}"
+    end
+  end
+
+  def update_gemspecs
+    gemspecs_to_fetch.each do |g_spec|
+      @pool.job do
+        @fetcher.fetch(from("quick/Marshal.#{Gem.marshal_version}", g_spec), to("quick/Marshal.#{Gem.marshal_version}", g_spec))
+        yield if block_given?
+      end
+    end
+    @pool.run_til_done
   end
 
   def update_gems
@@ -81,14 +134,6 @@ class Gem::Mirror
         yield if block_given?
       end
     end
-
-    gemspecs_to_fetch.each do |g_spec|
-      @pool.job do
-        @fetcher.fetch(from("quick/Marshal.#{Gem.marshal_version}", g_spec), to("quick/Marshal.#{Gem.marshal_version}", g_spec))
-        yield if block_given?
-      end
-    end
-
     @pool.run_til_done
   end
 
